@@ -17,11 +17,18 @@ SERVER_ID    = int(os.getenv("SERVER_ID", 0))
 VOICE_CH_ID  = int(os.getenv("VOICE_CHANNEL_ID", 0))
 TEXT_CH_ID   = int(os.getenv("TEXT_CHANNEL_ID", 0))
 
-# ─── FREE LAVALINK NODES (HeavenCloud) ────────────────────
-# 30+ sources: Spotify, YouTube, SoundCloud, Apple Music, Deezer etc.
+# ─── FREE LAVALINK NODES (Multiple fallbacks) ─────────────
+# Sources: Spotify, YouTube, SoundCloud, Apple Music, Deezer etc.
+# Using multiple nodes — bot will auto-failover if one goes down
 LAVALINK_NODES = [
-    {"uri": "https://lavalink.heavencloud.in:443", "password": "heavencloud"},
-    {"uri": "https://eu.lavalink.heavencloud.in:443", "password": "heavencloud"},
+    # Node 1 — Serenetia (v4, SSL)
+    {"uri": "https://lavalinkv4.serenetia.com:443", "password": "https://seretia.link/discord"},
+    # Node 2 — Jirayu (v4, SSL)
+    {"uri": "https://lavalink.jirayu.net:443", "password": "youshallnotpass"},
+    # Node 3 — TriniumHost (v4, SSL)
+    {"uri": "https://lavalink-v4.triniumhost.com:443", "password": "free"},
+    # Node 4 — MilloHost (v4, SSL)
+    {"uri": "https://lava-v4.millohost.my.id:443", "password": "https://discord.gg/mjS5J2K3ep"},
 ]
 
 # ─── INTENTS ──────────────────────────────────────────────
