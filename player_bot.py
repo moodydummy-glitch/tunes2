@@ -1,15 +1,13 @@
 import discord
 from discord.ext import commands
 from discord import app_commands, Embed
+import wavelink
 import asyncio
 import os
-import yt_dlp
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+import random
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from aiohttp import web
-import random
 
 load_dotenv()
 
@@ -18,20 +16,13 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN")
 SERVER_ID    = int(os.getenv("SERVER_ID", 0))
 VOICE_CH_ID  = int(os.getenv("VOICE_CHANNEL_ID", 0))
 TEXT_CH_ID   = int(os.getenv("TEXT_CHANNEL_ID", 0))
-SP_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SP_CLIENT_SC = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-# ─── SPOTIFY ──────────────────────────────────────────────
-sp = None
-if SP_CLIENT_ID and SP_CLIENT_SC:
-    try:
-        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-            client_id=SP_CLIENT_ID,
-            client_secret=SP_CLIENT_SC
-        ))
-        print("✅ Spotify connected")
-    except Exception as e:
-        print(f"⚠️ Spotify failed: {e}")
+# ─── FREE LAVALINK NODES (HeavenCloud) ────────────────────
+# 30+ sources: Spotify, YouTube, SoundCloud, Apple Music, Deezer etc.
+LAVALINK_NODES = [
+    {"uri": "https://lavalink.heavencloud.in:443", "password": "heavencloud"},
+    {"uri": "https://eu.lavalink.heavencloud.in:443", "password": "heavencloud"},
+]
 
 # ─── INTENTS ──────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -41,210 +32,174 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ─── YT-DLP (SoundCloud only — reliable on cloud servers) ──
-YDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "scsearch",
-}
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn"
-}
-
 # ─── STATE PER GUILD ──────────────────────────────────────
-queues     = {}   # guild_id -> [{"title","url","duration","thumbnail","uploader","webpage"}]
-history    = {}   # guild_id -> [song_info]  (previously played)
-volumes    = {}   # guild_id -> float 0-1
-loops      = {}   # guild_id -> bool
-shuffles   = {}   # guild_id -> bool
-current    = {}   # guild_id -> song_info
-np_message = {}   # guild_id -> discord.Message (now playing message)
+np_message = {}   # guild_id -> discord.Message
 
-def get_queue(gid): return queues.setdefault(gid, [])
-def get_history(gid): return history.setdefault(gid, [])
-def get_volume(gid): return volumes.get(gid, 0.5)
-def is_looping(gid): return loops.get(gid, False)
-def is_shuffling(gid): return shuffles.get(gid, False)
-
-# ─── AUDIO FETCHING ───────────────────────────────────────
-def resolve_spotify(url: str):
-    """Convert Spotify URL to search query."""
-    if not sp:
-        return None
-    try:
-        if "track" in url:
-            t = sp.track(url)
-            return f"{t['name']} {t['artists'][0]['name']}"
-        elif "playlist" in url:
-            results = sp.playlist_tracks(url, limit=25)
-            tracks = []
-            for item in results["items"]:
-                t = item.get("track")
-                if t:
-                    tracks.append(f"{t['name']} {t['artists'][0]['name']}")
-            return tracks
-        elif "album" in url:
-            results = sp.album_tracks(url, limit=25)
-            tracks = []
-            for t in results["items"]:
-                tracks.append(f"{t['name']} {t['artists'][0]['name']}")
-            return tracks
-    except Exception as e:
-        print(f"⚠️ Spotify resolve error: {e}")
-    return None
-
-def fetch_audio(query: str):
-    """Fetch audio info from SoundCloud."""
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            if query.startswith("http"):
-                info = ydl.extract_info(query, download=False)
-            else:
-                info = ydl.extract_info(f"scsearch:{query}", download=False)
-                info = info["entries"][0]
-            return {
-                "title":     info.get("title", "Unknown"),
-                "url":       info["url"],
-                "duration":  info.get("duration", 0),
-                "thumbnail": info.get("thumbnail", ""),
-                "uploader":  info.get("uploader", "Unknown"),
-                "webpage":   info.get("webpage_url", ""),
-            }
-    except Exception as e:
-        print(f"❌ Audio fetch error: {e}")
-        return None
-
-def fmt_duration(s):
-    if not s: return "Live"
-    m, s = divmod(int(s), 60)
+# ─── HELPERS ──────────────────────────────────────────────
+def fmt_duration(ms):
+    if not ms: return "Live"
+    s = ms // 1000
+    m, s = divmod(s, 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
-# ─── NOW PLAYING EMBED + BUTTONS ──────────────────────────
-def build_np_embed(info, gid):
-    vol  = int(get_volume(gid) * 100)
-    loop = "🔁 On" if is_looping(gid)  else "➡️ Off"
-    shuf = "🔀 On" if is_shuffling(gid) else "➡️ Off"
-    q    = get_queue(gid)
+def build_np_embed(player: wavelink.Player, track: wavelink.Playable):
+    vol   = player.volume
+    loop  = player.queue.mode == wavelink.QueueMode.loop
+    shuf  = player.queue.mode == wavelink.QueueMode.normal and getattr(player, "_shuffle", False)
+    qlen  = len(player.queue)
 
     embed = Embed(
         title="▶️  Now Playing",
-        description=f"### [{info['title']}]({info['webpage']})",
+        description=f"### [{track.title}]({track.uri})",
         color=0x1db954
     )
-    if info.get("thumbnail"):
-        embed.set_image(url=info["thumbnail"])
-    embed.add_field(name="⏱️ Duration", value=fmt_duration(info["duration"]), inline=True)
-    embed.add_field(name="🎤 Artist",   value=info["uploader"],                inline=True)
-    embed.add_field(name="🔊 Volume",   value=f"{vol}%",                       inline=True)
-    embed.add_field(name="🔁 Loop",     value=loop,                            inline=True)
-    embed.add_field(name="🔀 Shuffle",  value=shuf,                            inline=True)
-    embed.add_field(name="📋 Queue",    value=f"{len(q)} song(s)",             inline=True)
+    if track.artwork:
+        embed.set_image(url=track.artwork)
+    embed.add_field(name="⏱️ Duration", value=fmt_duration(track.length), inline=True)
+    embed.add_field(name="🎤 Artist",   value=track.author or "Unknown",  inline=True)
+    embed.add_field(name="🔊 Volume",   value=f"{vol}%",                  inline=True)
+    embed.add_field(name="🔁 Loop",     value="On" if loop else "Off",    inline=True)
+    embed.add_field(name="📋 Queue",    value=f"{qlen} song(s)",          inline=True)
     embed.set_footer(text="🎵 Use the buttons below to control playback")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
+async def refresh_np(guild: discord.Guild):
+    gid = guild.id
+    msg = np_message.get(gid)
+    player: wavelink.Player = guild.voice_client
+    if msg and player and player.current:
+        try:
+            await msg.edit(
+                embed=build_np_embed(player, player.current),
+                view=PlayerView(gid)
+            )
+        except Exception:
+            pass
+
+# ─── PLAYER BUTTONS ───────────────────────────────────────
 class PlayerView(discord.ui.View):
-    """Persistent interactive player buttons."""
     def __init__(self, gid: int):
         super().__init__(timeout=None)
         self.gid = gid
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="shuffle")
-    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
-        shuffles[gid] = not is_shuffling(gid)
-        state = "enabled 🔀" if is_shuffling(gid) else "disabled"
-        await interaction.response.send_message(f"Shuffle {state}!", ephemeral=True)
-        await refresh_np(interaction.guild)
-
-    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, custom_id="previous")
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, custom_id="prev")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
-        hist = get_history(gid)
-        if not hist:
-            return await interaction.response.send_message("No previous songs!", ephemeral=True)
-        prev = hist.pop()
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            get_queue(gid).insert(0, current.get(gid, {}))
-            get_queue(gid).insert(0, prev)
-            vc.stop()
-            await interaction.response.send_message(f"⏮️ Going back to **{prev['title']}**!", ephemeral=True)
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Not playing!", ephemeral=True)
+        if player.queue.history and len(player.queue.history) > 0:
+            prev = player.queue.history[-1]
+            await player.play(prev)
+            await interaction.response.send_message(f"⏮️ Playing previous: **{prev.title}**", ephemeral=True)
+            await refresh_np(interaction.guild)
         else:
-            await interaction.response.send_message("Nothing playing!", ephemeral=True)
+            await interaction.response.send_message("❌ No previous songs!", ephemeral=True)
 
     @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, custom_id="pause_resume")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            vc.pause()
-            button.emoji = "▶️"
-            await interaction.response.edit_message(view=self)
-        elif vc and vc.is_paused():
-            vc.resume()
-            button.emoji = "⏸️"
-            await interaction.response.edit_message(view=self)
-        else:
-            await interaction.response.send_message("Nothing playing!", ephemeral=True)
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Not playing!", ephemeral=True)
+        await player.pause(not player.paused)
+        button.emoji = "▶️" if player.paused else "⏸️"
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-            await interaction.response.send_message("⏭️ Skipped!", ephemeral=True)
-        else:
-            await interaction.response.send_message("Nothing playing!", ephemeral=True)
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player or not player.current:
+            return await interaction.response.send_message("❌ Not playing!", ephemeral=True)
+        await player.skip(force=True)
+        await interaction.response.send_message("⏭️ Skipped!", ephemeral=True)
 
-    @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, custom_id="queue_btn")
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="loop")
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Not playing!", ephemeral=True)
+        if player.queue.mode == wavelink.QueueMode.loop:
+            player.queue.mode = wavelink.QueueMode.normal
+            await interaction.response.send_message("🔁 Loop **disabled**!", ephemeral=True)
+        else:
+            player.queue.mode = wavelink.QueueMode.loop
+            await interaction.response.send_message("🔁 Loop **enabled**!", ephemeral=True)
+        await refresh_np(interaction.guild)
+
+    @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, custom_id="queue_view")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
-        q = get_queue(gid)
-        cur = current.get(gid)
-        if not q and not cur:
-            return await interaction.response.send_message("Queue is empty!", ephemeral=True)
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Not playing!", ephemeral=True)
         embed = Embed(title="📋 Queue", color=0x1db954)
-        if cur:
+        if player.current:
             embed.add_field(
                 name="▶️ Now Playing",
-                value=f"[{cur['title']}]({cur['webpage']}) — {fmt_duration(cur['duration'])}",
+                value=f"[{player.current.title}]({player.current.uri}) — {fmt_duration(player.current.length)}",
                 inline=False
             )
-        if q:
-            lines = [f"`{i+1}.` [{s['title']}]({s['webpage']}) — {fmt_duration(s['duration'])}"
-                     for i, s in enumerate(q[:10])]
-            if len(q) > 10:
-                lines.append(f"*...and {len(q)-10} more*")
+        if player.queue:
+            lines = [
+                f"`{i+1}.` [{t.title}]({t.uri}) — {fmt_duration(t.length)}"
+                for i, t in enumerate(list(player.queue)[:10])
+            ]
+            if len(player.queue) > 10:
+                lines.append(f"*...and {len(player.queue)-10} more*")
             embed.add_field(name="⏭️ Up Next", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="⏭️ Up Next", value="Queue is empty!", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-async def refresh_np(guild):
-    """Update the now playing message embed."""
-    gid = guild.id
-    msg = np_message.get(gid)
-    info = current.get(gid)
-    if msg and info:
-        try:
-            await msg.edit(embed=build_np_embed(info, gid), view=PlayerView(gid))
-        except Exception:
-            pass
+# ─── WAVELINK EVENTS ──────────────────────────────────────
+@bot.event
+async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    print(f"✅ Lavalink node ready: {payload.node.uri}")
 
-# ─── PLAYBACK ENGINE ──────────────────────────────────────
-async def play_next(guild):
-    gid = guild.id
-    vc  = guild.voice_client
-    if not vc or not vc.is_connected():
+@bot.event
+async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
+    player = payload.player
+    if not player or not player.guild:
         return
+    guild = player.guild
+    gid   = guild.id
+    track = payload.track
 
-    q = get_queue(gid)
-    if not q:
-        current[gid] = None
-        # Update np embed to show nothing playing
+    embed = build_np_embed(player, track)
+    view  = PlayerView(gid)
+
+    # Delete old now playing message
+    old = np_message.get(gid)
+    if old:
+        try: await old.delete()
+        except: pass
+
+    # Send to text channel if set, otherwise find last used channel
+    ch = None
+    if TEXT_CH_ID:
+        ch = bot.get_channel(TEXT_CH_ID)
+    if not ch:
+        # Try to find a suitable channel
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                ch = channel
+                break
+
+    if ch:
+        try:
+            msg = await ch.send(embed=embed, view=view)
+            np_message[gid] = msg
+        except Exception as e:
+            print(f"⚠️ Could not send now playing: {e}")
+
+@bot.event
+async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
+    player = payload.player
+    if not player or not player.guild:
+        return
+    # If queue is empty update embed
+    if not player.queue and not player.current:
+        gid = player.guild.id
         msg = np_message.get(gid)
         if msg:
             try:
@@ -254,63 +209,24 @@ async def play_next(guild):
                     color=0x95a5a6
                 )
                 await msg.edit(embed=embed, view=None)
-            except Exception:
-                pass
-        return
-
-    if is_shuffling(gid):
-        random.shuffle(q)
-
-    info = q.pop(0)
-
-    # Save to history
-    hist = get_history(gid)
-    if current.get(gid):
-        hist.append(current[gid])
-        if len(hist) > 10:
-            hist.pop(0)
-
-    current[gid] = info
-
-    source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTIONS),
-        volume=get_volume(gid)
-    )
-
-    def after_playing(error):
-        if error:
-            print(f"❌ Playback error: {error}")
-        if is_looping(gid) and current.get(gid):
-            # Re-add current song to front of queue
-            get_queue(gid).insert(0, current[gid])
-        asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
-
-    vc.play(source, after=after_playing)
-
-    # Update now playing message
-    await refresh_np(guild)
-
-# ─── VOICE HELPERS ────────────────────────────────────────
-async def ensure_voice(interaction: discord.Interaction):
-    """Make sure bot is in user's voice channel."""
-    if not interaction.user.voice:
-        await interaction.followup.send("❌ Join a voice channel first!")
-        return None
-    vc = interaction.guild.voice_client
-    try:
-        if vc and vc.is_connected():
-            if vc.channel.id != interaction.user.voice.channel.id:
-                await vc.move_to(interaction.user.voice.channel)
-        elif vc and not vc.is_connected():
-            try: await vc.disconnect(force=True)
             except: pass
-            await asyncio.sleep(1)
-            vc = await interaction.user.voice.channel.connect()
-        else:
-            vc = await interaction.user.voice.channel.connect()
-    except discord.ClientException:
-        vc = interaction.guild.voice_client
-    return vc
+
+@bot.event
+async def on_wavelink_inactive_player(player: wavelink.Player):
+    """Auto disconnect after 5 mins of inactivity — rejoin home channel."""
+    gid = player.guild.id
+    print(f"💤 Player inactive in guild {gid}")
+    await player.disconnect()
+    # Rejoin home voice channel
+    if VOICE_CH_ID:
+        await asyncio.sleep(3)
+        ch = bot.get_channel(VOICE_CH_ID)
+        if ch and isinstance(ch, discord.VoiceChannel):
+            try:
+                await ch.connect(cls=wavelink.Player)
+                print(f"✅ Rejoined home channel: {ch.name}")
+            except Exception as e:
+                print(f"⚠️ Rejoin error: {e}")
 
 # ─── STATUS LOOP ──────────────────────────────────────────
 async def status_loop():
@@ -319,43 +235,17 @@ async def status_loop():
         discord.Activity(type=discord.ActivityType.listening, name="/play to add songs 🎵"),
         discord.Activity(type=discord.ActivityType.playing,   name="music 24/7 🎧"),
         discord.Activity(type=discord.ActivityType.watching,  name="/queue to see songs 📋"),
-        discord.Activity(type=discord.ActivityType.listening, name="/nowplaying for info 🎤"),
+        discord.Activity(type=discord.ActivityType.listening, name="Spotify & YouTube 🎤"),
+        discord.Activity(type=discord.ActivityType.watching,  name="/nowplaying for info 🎵"),
     ]
     i = 0
     while not bot.is_closed():
-        await bot.change_presence(status=discord.Status.online, activity=statuses[i % len(statuses)])
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=statuses[i % len(statuses)]
+        )
         i += 1
         await asyncio.sleep(60)
-
-# ─── VOICE RECONNECT ──────────────────────────────────────
-async def voice_reconnect_loop():
-    await bot.wait_until_ready()
-    await asyncio.sleep(5)
-    while not bot.is_closed():
-        await asyncio.sleep(60)
-        if not VOICE_CH_ID: continue
-        try:
-            ch = bot.get_channel(VOICE_CH_ID)
-            if not ch: ch = await bot.fetch_channel(VOICE_CH_ID)
-            if ch and isinstance(ch, discord.VoiceChannel):
-                vc = ch.guild.voice_client
-                if not vc or not vc.is_connected():
-                    await ch.connect(reconnect=True)
-                    print(f"✅ Reconnected to voice: {ch.name}")
-        except Exception as e:
-            print(f"⚠️ Voice reconnect error: {e}")
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.id == bot.user.id and before.channel and not after.channel:
-        print("⚠️ Bot disconnected from voice, rejoining in 10s...")
-        await asyncio.sleep(10)
-        if VOICE_CH_ID:
-            try:
-                ch = bot.get_channel(VOICE_CH_ID) or await bot.fetch_channel(VOICE_CH_ID)
-                if ch: await ch.connect(reconnect=True)
-            except Exception as e:
-                print(f"❌ Rejoin error: {e}")
 
 # ─── EVENTS ───────────────────────────────────────────────
 @bot.event
@@ -371,145 +261,161 @@ async def on_ready():
 
     # Set avatar
     try:
-        if os.path.exists("avatar.gif"):
-            with open("avatar.gif", "rb") as f:
-                await bot.user.edit(avatar=f.read())
-            print("✅ Avatar set!")
-        elif os.path.exists("avatar.png"):
-            with open("avatar.png", "rb") as f:
-                await bot.user.edit(avatar=f.read())
-            print("✅ Avatar set!")
+        for fname in ["avatar.gif", "avatar.png"]:
+            if os.path.exists(fname):
+                with open(fname, "rb") as f:
+                    await bot.user.edit(avatar=f.read())
+                print(f"✅ Avatar set from {fname}!")
+                break
     except Exception as e:
         print(f"⚠️ Avatar: {e}")
 
     bot.loop.create_task(status_loop())
-    bot.loop.create_task(voice_reconnect_loop())
 
-    # Auto join voice
+    # Auto join home voice channel
     if VOICE_CH_ID:
-        try:
-            ch = bot.get_channel(VOICE_CH_ID) or await bot.fetch_channel(VOICE_CH_ID)
-            if ch and isinstance(ch, discord.VoiceChannel):
-                await ch.connect(reconnect=True)
+        await asyncio.sleep(3)
+        ch = bot.get_channel(VOICE_CH_ID)
+        if not ch:
+            try: ch = await bot.fetch_channel(VOICE_CH_ID)
+            except: pass
+        if ch and isinstance(ch, discord.VoiceChannel):
+            try:
+                await ch.connect(cls=wavelink.Player)
                 print(f"✅ Joined voice: {ch.name}")
-        except Exception as e:
-            print(f"⚠️ Voice join: {e}")
+            except Exception as e:
+                print(f"⚠️ Voice join: {e}")
 
     print("✅ All systems go! 🎵")
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Rejoin home channel if bot gets disconnected."""
+    if member.id != bot.user.id:
+        return
+    if before.channel and not after.channel:
+        print("⚠️ Disconnected from voice, rejoining in 10s...")
+        await asyncio.sleep(10)
+        if VOICE_CH_ID:
+            ch = bot.get_channel(VOICE_CH_ID)
+            if ch and isinstance(ch, discord.VoiceChannel):
+                try:
+                    await ch.connect(cls=wavelink.Player)
+                    print(f"✅ Rejoined: {ch.name}")
+                except Exception as e:
+                    print(f"❌ Rejoin error: {e}")
+
 # ─── SLASH COMMANDS ───────────────────────────────────────
 
-@tree.command(name="play", description="Play a song — supports SoundCloud, Spotify links")
-@app_commands.describe(query="Song name, SoundCloud URL, or Spotify link")
+@tree.command(name="play", description="Play a song — Spotify, YouTube, SoundCloud, Apple Music, Deezer")
+@app_commands.describe(query="Song name, Spotify link, YouTube link, SoundCloud link etc.")
 async def play(interaction: discord.Interaction, query: str):
     if TEXT_CH_ID and interaction.channel_id != TEXT_CH_ID:
         return await interaction.response.send_message(
             f"❌ Use commands in <#{TEXT_CH_ID}>!", ephemeral=True
         )
+
+    if not interaction.user.voice:
+        return await interaction.response.send_message(
+            "❌ Join a voice channel first!", ephemeral=True
+        )
+
     await interaction.response.defer()
 
-    vc = await ensure_voice(interaction)
-    if not vc: return
+    player: wavelink.Player = interaction.guild.voice_client
 
-    songs_to_add = []
+    # Connect if not in voice
+    if not player or not player.connected:
+        try:
+            player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Could not join voice: {e}")
+    elif player.channel != interaction.user.voice.channel:
+        await player.move_to(interaction.user.voice.channel)
 
-    # Handle Spotify
-    if "spotify.com" in query:
-        if not sp:
-            return await interaction.followup.send("❌ Spotify not configured. Add `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` to Railway variables.")
-        result = resolve_spotify(query)
-        if not result:
-            return await interaction.followup.send("❌ Could not read Spotify link.")
-        if isinstance(result, list):
-            await interaction.followup.send(f"🎵 Loading **{len(result)}** songs from Spotify...")
-            for r in result:
-                info = await asyncio.get_event_loop().run_in_executor(None, fetch_audio, r)
-                if info: songs_to_add.append(info)
+    # Set volume default
+    await player.set_volume(70)
+
+    # Search / load tracks
+    try:
+        tracks = await wavelink.Playable.search(query)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Search error: {e}")
+
+    if not tracks:
+        return await interaction.followup.send("❌ No results found! Try a different search.")
+
+    # Handle playlists vs single tracks
+    if isinstance(tracks, wavelink.Playlist):
+        added = len(tracks.tracks)
+        for track in tracks.tracks:
+            await player.queue.put_wait(track)
+        await interaction.followup.send(
+            f"📋 Added playlist **{tracks.name}** — **{added}** songs!"
+        )
+    else:
+        track = tracks[0]
+        await player.queue.put_wait(track)
+        if not player.playing:
+            pass  # will auto play
         else:
-            info = await asyncio.get_event_loop().run_in_executor(None, fetch_audio, result)
-            if info: songs_to_add.append(info)
-    else:
-        info = await asyncio.get_event_loop().run_in_executor(None, fetch_audio, query)
-        if info: songs_to_add.append(info)
-
-    if not songs_to_add:
-        return await interaction.followup.send("❌ Could not find that song!")
-
-    gid = interaction.guild.id
-    q   = get_queue(gid)
-
-    for s in songs_to_add:
-        q.append(s)
-
-    if not vc.is_playing() and not vc.is_paused():
-        await play_next(interaction.guild)
-
-        # Send now playing message with buttons
-        info = current.get(gid)
-        if info:
-            embed = build_np_embed(info, gid)
-            view  = PlayerView(gid)
-
-            # Delete old np message
-            old = np_message.get(gid)
-            if old:
-                try: await old.delete()
-                except: pass
-
-            msg = await interaction.followup.send(embed=embed, view=view)
-            np_message[gid] = msg
-    else:
-        if len(songs_to_add) == 1:
             embed = Embed(
                 title="📋 Added to Queue",
-                description=f"[{songs_to_add[0]['title']}]({songs_to_add[0]['webpage']})",
+                description=f"[{track.title}]({track.uri})",
                 color=0x1db954
             )
-            embed.add_field(name="Position", value=f"#{len(q)}", inline=True)
-            embed.add_field(name="Duration",  value=fmt_duration(songs_to_add[0]["duration"]), inline=True)
-            if songs_to_add[0].get("thumbnail"):
-                embed.set_thumbnail(url=songs_to_add[0]["thumbnail"])
+            embed.add_field(name="Duration", value=fmt_duration(track.length), inline=True)
+            embed.add_field(name="Artist",   value=track.author or "Unknown",  inline=True)
+            embed.add_field(name="Position", value=f"#{len(player.queue)}",    inline=True)
+            if track.artwork:
+                embed.set_thumbnail(url=track.artwork)
             await interaction.followup.send(embed=embed)
-        else:
-            await interaction.followup.send(f"✅ Added **{len(songs_to_add)}** songs to queue!")
+
+    # Start playing if not already
+    if not player.playing:
+        await player.play(player.queue.get())
+        await interaction.followup.send("✅ Starting playback...")
 
 @tree.command(name="nowplaying", description="Show the now playing card with controls")
 async def nowplaying(interaction: discord.Interaction):
-    gid  = interaction.guild.id
-    info = current.get(gid)
-    if not info:
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player or not player.current:
         return await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
     await interaction.response.defer()
+    gid = interaction.guild.id
     old = np_message.get(gid)
     if old:
         try: await old.delete()
         except: pass
-    msg = await interaction.followup.send(embed=build_np_embed(info, gid), view=PlayerView(gid))
+    msg = await interaction.followup.send(
+        embed=build_np_embed(player, player.current),
+        view=PlayerView(gid)
+    )
     np_message[gid] = msg
 
 @tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
+    player: wavelink.Player = interaction.guild.voice_client
+    if player and player.current:
+        await player.skip(force=True)
         await interaction.response.send_message("⏭️ Skipped!")
     else:
         await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
 
 @tree.command(name="pause", description="Pause playback")
 async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and vc.is_playing():
-        vc.pause()
+    player: wavelink.Player = interaction.guild.voice_client
+    if player and not player.paused:
+        await player.pause(True)
         await interaction.response.send_message("⏸️ Paused!")
     else:
         await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
 
 @tree.command(name="resume", description="Resume playback")
 async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and vc.is_paused():
-        vc.resume()
+    player: wavelink.Player = interaction.guild.voice_client
+    if player and player.paused:
+        await player.pause(False)
         await interaction.response.send_message("▶️ Resumed!")
     else:
         await interaction.response.send_message("❌ Nothing paused!", ephemeral=True)
@@ -519,111 +425,126 @@ async def resume(interaction: discord.Interaction):
 async def volume(interaction: discord.Interaction, level: int):
     if not 0 <= level <= 100:
         return await interaction.response.send_message("❌ Volume must be 0–100!", ephemeral=True)
-    gid = interaction.guild.id
-    volumes[gid] = level / 100
-    vc = interaction.guild.voice_client
-    if vc and vc.source:
-        vc.source.volume = level / 100
-    await interaction.response.send_message(f"🔊 Volume set to **{level}%**")
-    await refresh_np(interaction.guild)
+    player: wavelink.Player = interaction.guild.voice_client
+    if player:
+        await player.set_volume(level)
+        await interaction.response.send_message(f"🔊 Volume set to **{level}%**")
+        await refresh_np(interaction.guild)
+    else:
+        await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
 
 @tree.command(name="loop", description="Toggle loop mode")
 async def loop(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    loops[gid] = not is_looping(gid)
-    state = "enabled 🔁" if is_looping(gid) else "disabled"
-    await interaction.response.send_message(f"Loop {state}!")
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player:
+        return await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
+    if player.queue.mode == wavelink.QueueMode.loop:
+        player.queue.mode = wavelink.QueueMode.normal
+        await interaction.response.send_message("🔁 Loop **disabled**!")
+    else:
+        player.queue.mode = wavelink.QueueMode.loop
+        await interaction.response.send_message("🔁 Loop **enabled**!")
     await refresh_np(interaction.guild)
 
-@tree.command(name="shuffle", description="Toggle shuffle mode")
+@tree.command(name="shuffle", description="Shuffle the queue")
 async def shuffle(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    shuffles[gid] = not is_shuffling(gid)
-    state = "enabled 🔀" if is_shuffling(gid) else "disabled"
-    await interaction.response.send_message(f"Shuffle {state}!")
-    await refresh_np(interaction.guild)
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player or not player.queue:
+        return await interaction.response.send_message("❌ Queue is empty!", ephemeral=True)
+    player.queue.shuffle()
+    await interaction.response.send_message("🔀 Queue shuffled!")
 
 @tree.command(name="queue", description="Show the queue")
 async def queue_cmd(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    q   = get_queue(gid)
-    cur = current.get(gid)
-    if not q and not cur:
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player:
         return await interaction.response.send_message("📋 Queue is empty!", ephemeral=True)
     embed = Embed(title="📋 Queue", color=0x1db954)
-    if cur:
+    if player.current:
         embed.add_field(
             name="▶️ Now Playing",
-            value=f"[{cur['title']}]({cur['webpage']}) — {fmt_duration(cur['duration'])}",
+            value=f"[{player.current.title}]({player.current.uri}) — {fmt_duration(player.current.length)}",
             inline=False
         )
-    if q:
-        lines = [f"`{i+1}.` [{s['title']}]({s['webpage']}) — {fmt_duration(s['duration'])}"
-                 for i, s in enumerate(q[:10])]
-        if len(q) > 10:
-            lines.append(f"*...and {len(q)-10} more*")
+    if player.queue:
+        lines = [
+            f"`{i+1}.` [{t.title}]({t.uri}) — {fmt_duration(t.length)}"
+            for i, t in enumerate(list(player.queue)[:10])
+        ]
+        if len(player.queue) > 10:
+            lines.append(f"*...and {len(player.queue)-10} more*")
         embed.add_field(name="⏭️ Up Next", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="⏭️ Up Next", value="Queue is empty!", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="stop", description="Stop music and clear queue")
 async def stop(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    queues[gid]  = []
-    current[gid] = None
-    vc = interaction.guild.voice_client
-    if vc: vc.stop()
-    await interaction.response.send_message("⏹️ Stopped and queue cleared!")
+    player: wavelink.Player = interaction.guild.voice_client
+    if player:
+        player.queue.clear()
+        await player.stop()
+        await interaction.response.send_message("⏹️ Stopped and queue cleared!")
+    else:
+        await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
 
 @tree.command(name="clear", description="Clear the queue")
 async def clear(interaction: discord.Interaction):
-    queues[interaction.guild.id] = []
-    await interaction.response.send_message("🗑️ Queue cleared!")
+    player: wavelink.Player = interaction.guild.voice_client
+    if player:
+        player.queue.clear()
+        await interaction.response.send_message("🗑️ Queue cleared!")
+    else:
+        await interaction.response.send_message("❌ Nothing playing!", ephemeral=True)
 
 @tree.command(name="join", description="Join your voice channel")
 async def join(interaction: discord.Interaction):
-    if interaction.user.voice:
-        ch = interaction.user.voice.channel
-        vc = interaction.guild.voice_client
-        if vc: await vc.move_to(ch)
-        else:  await ch.connect()
-        await interaction.response.send_message(f"✅ Joined **{ch.name}**!")
+    if not interaction.user.voice:
+        return await interaction.response.send_message("❌ Join a voice channel first!", ephemeral=True)
+    ch = interaction.user.voice.channel
+    player: wavelink.Player = interaction.guild.voice_client
+    if player:
+        await player.move_to(ch)
     else:
-        await interaction.response.send_message("❌ Join a voice channel first!", ephemeral=True)
+        await ch.connect(cls=wavelink.Player)
+    await interaction.response.send_message(f"✅ Joined **{ch.name}**!")
 
 @tree.command(name="leave", description="Leave voice channel")
 async def leave(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc:
-        queues[interaction.guild.id]  = []
-        current[interaction.guild.id] = None
-        await vc.disconnect()
+    player: wavelink.Player = interaction.guild.voice_client
+    if player:
+        player.queue.clear()
+        await player.disconnect()
         await interaction.response.send_message("👋 Left!")
     else:
         await interaction.response.send_message("❌ Not in a voice channel!", ephemeral=True)
 
 @tree.command(name="help", description="Show all commands")
 async def help_cmd(interaction: discord.Interaction):
-    embed = Embed(title="🎵 Music Bot Commands", color=0x1db954,
-                  description="*Supports SoundCloud, Spotify links!*\n\u200b")
-    embed.add_field(name="/play <song>",    value="Play a song or Spotify link", inline=False)
+    embed = Embed(
+        title="🎵 Music Bot Commands",
+        description="*Supports Spotify, YouTube, SoundCloud, Apple Music, Deezer and more!*\n\u200b",
+        color=0x1db954
+    )
+    embed.add_field(name="/play <song>",    value="Play — Spotify/YouTube/SoundCloud links or song name", inline=False)
     embed.add_field(name="/nowplaying",     value="Show player card with buttons", inline=False)
     embed.add_field(name="/queue",          value="Show the queue", inline=False)
     embed.add_field(name="/skip",           value="Skip current song", inline=False)
     embed.add_field(name="/pause",          value="Pause playback", inline=False)
     embed.add_field(name="/resume",         value="Resume playback", inline=False)
     embed.add_field(name="/volume <0-100>", value="Set volume", inline=False)
-    embed.add_field(name="/loop",           value="Toggle loop", inline=False)
-    embed.add_field(name="/shuffle",        value="Toggle shuffle", inline=False)
+    embed.add_field(name="/loop",           value="Toggle loop mode", inline=False)
+    embed.add_field(name="/shuffle",        value="Shuffle the queue", inline=False)
     embed.add_field(name="/stop",           value="Stop and clear queue", inline=False)
-    embed.add_field(name="/clear",          value="Clear queue", inline=False)
+    embed.add_field(name="/clear",          value="Clear queue only", inline=False)
     embed.add_field(name="/join",           value="Join your voice channel", inline=False)
     embed.add_field(name="/leave",          value="Leave voice channel", inline=False)
-    embed.set_footer(text="🎵 Use /play to get started!")
+    embed.set_footer(text="🎵 Powered by Lavalink + HeavenCloud")
     await interaction.response.send_message(embed=embed)
 
 # ─── KEEP ALIVE ───────────────────────────────────────────
 async def handle(request):
-    return web.Response(text="🎵 Music bot is alive!")
+    return web.Response(text="🎵 Music bot alive!")
 
 async def run_web():
     app = web.Application()
@@ -635,8 +556,16 @@ async def run_web():
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web server on port {port}")
 
+# ─── SETUP HOOK ───────────────────────────────────────────
 @bot.event
 async def setup_hook():
     await run_web()
+    # Connect to free Lavalink nodes
+    nodes = [
+        wavelink.Node(uri=n["uri"], password=n["password"])
+        for n in LAVALINK_NODES
+    ]
+    await wavelink.Pool.connect(nodes=nodes, client=bot, cache_capacity=100)
+    print(f"✅ Connecting to {len(nodes)} Lavalink node(s)...")
 
 bot.run(BOT_TOKEN)
