@@ -343,11 +343,24 @@ async def play(interaction: discord.Interaction, query: str):
     # Set volume default
     await player.set_volume(70)
 
-    # Search / load tracks
+    # Search / load tracks — detect URL vs plain text
     try:
-        tracks = await wavelink.Playable.search(query)
+        if query.startswith("http"):
+            # Direct URL — Spotify, YouTube, SoundCloud etc.
+            tracks = await wavelink.Playable.search(query)
+        else:
+            # Plain text search — use SoundCloud (most reliable on public nodes)
+            tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.SoundCloud)
+            # If SoundCloud fails, try YouTube
+            if not tracks:
+                tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
     except Exception as e:
-        return await interaction.followup.send(f"❌ Search error: {e}")
+        print(f"[Search] Error: {e}")
+        # Final fallback — try YouTube directly
+        try:
+            tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
+        except Exception as e2:
+            return await interaction.followup.send(f"❌ Could not find that song! Try a different search or paste a direct link.")
 
     if not tracks:
         return await interaction.followup.send("❌ No results found! Try a different search.")
@@ -380,8 +393,9 @@ async def play(interaction: discord.Interaction, query: str):
 
     # Start playing if not already
     if not player.playing:
-        await player.play(player.queue.get())
-        await interaction.followup.send("✅ Starting playback...")
+        track = player.queue.get()
+        await player.play(track)
+        # Don't send extra message — on_wavelink_track_start handles the embed
 
 @tree.command(name="nowplaying", description="Show the now playing card with controls")
 async def nowplaying(interaction: discord.Interaction):
