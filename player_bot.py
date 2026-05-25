@@ -343,24 +343,24 @@ async def play(interaction: discord.Interaction, query: str):
     # Set volume default
     await player.set_volume(70)
 
-    # Search / load tracks — detect URL vs plain text
+    # Search / load tracks
+    tracks = None
     try:
         if query.startswith("http"):
-            # Direct URL — Spotify, YouTube, SoundCloud etc.
+            # Direct URL — pass as-is (Spotify, SoundCloud, YouTube links)
             tracks = await wavelink.Playable.search(query)
         else:
-            # Plain text search — use SoundCloud (most reliable on public nodes)
-            tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.SoundCloud)
-            # If SoundCloud fails, try YouTube
-            if not tracks:
-                tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
+            # Plain text — ALWAYS use SoundCloud (YouTube is blocked on public nodes)
+            tracks = await wavelink.Playable.search(f"scsearch:{query}")
     except Exception as e:
         print(f"[Search] Error: {e}")
-        # Final fallback — try YouTube directly
-        try:
-            tracks = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
-        except Exception as e2:
-            return await interaction.followup.send(f"❌ Could not find that song! Try a different search or paste a direct link.")
+
+    if not tracks:
+        return await interaction.followup.send(
+            "❌ Could not find that song!
+"
+            "💡 Try pasting a direct **SoundCloud** or **Spotify** link instead."
+        )
 
     if not tracks:
         return await interaction.followup.send("❌ No results found! Try a different search.")
