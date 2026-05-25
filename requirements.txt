@@ -1,0 +1,8 @@
+discord.py[voice]
+davey
+PyNaCl
+yt-dlp
+spotipy
+aiohttp
+python-dotenv
+requests
