@@ -1,4 +1,6 @@
-discord.py
-wavelink
+discord.py[voice]
+davey
+PyNaCl
+yt-dlp
 aiohttp
 python-dotenv
