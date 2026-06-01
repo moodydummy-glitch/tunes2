@@ -5,6 +5,7 @@ import asyncio
 import os
 import yt_dlp
 import random
+import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from aiohttp import web
@@ -16,6 +17,17 @@ BOT_TOKEN   = os.getenv("BOT_TOKEN")
 SERVER_ID   = int(os.getenv("SERVER_ID", 0))
 VOICE_CH_ID = int(os.getenv("VOICE_CHANNEL_ID", 0))
 TEXT_CH_ID  = int(os.getenv("TEXT_CHANNEL_ID", 0))
+AFK_TIMEOUT = int(os.getenv("AFK_TIMEOUT", 300))  # seconds before returning home (default 5 min)
+
+# ─── ACTIVITY TRACKER ─────────────────────────────────────
+import time
+last_activity = {}  # guild_id -> timestamp
+
+def update_activity(guild_id: int):
+    last_activity[guild_id] = time.time()
+
+def idle_seconds(guild_id: int) -> float:
+    return time.time() - last_activity.get(guild_id, 0)
 
 # ─── INTENTS ──────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -242,7 +254,7 @@ async def get_or_connect_vc(interaction: discord.Interaction):
         vc = interaction.guild.voice_client
     return vc
 
-# ─── AUTO VOICE RECONNECT ─────────────────────────────────
+# ─── AUTO VOICE RECONNECT + AFK RETURN ───────────────────
 async def voice_reconnect_loop():
     await bot.wait_until_ready()
     await asyncio.sleep(10)
@@ -251,16 +263,58 @@ async def voice_reconnect_loop():
         if not VOICE_CH_ID:
             continue
         try:
-            ch = bot.get_channel(VOICE_CH_ID)
-            if not ch:
-                ch = await bot.fetch_channel(VOICE_CH_ID)
-            if not ch or not isinstance(ch, discord.VoiceChannel):
+            home_ch = bot.get_channel(VOICE_CH_ID)
+            if not home_ch:
+                home_ch = await bot.fetch_channel(VOICE_CH_ID)
+            if not home_ch or not isinstance(home_ch, discord.VoiceChannel):
                 continue
-            vc = ch.guild.voice_client
+
+            guild = home_ch.guild
+            vc    = guild.voice_client
+            gid   = guild.id
+
+            # ── Not connected at all — rejoin home ──
             if not vc or not vc.is_connected():
-                print("⚠️ Not in voice — reconnecting...")
-                await ch.connect(reconnect=True)
-                print(f"✅ Reconnected to: {ch.name}")
+                print("⚠️ Not in voice — reconnecting to home...")
+                await home_ch.connect(reconnect=True)
+                print(f"✅ Reconnected to: {home_ch.name}")
+
+            # ── In a different channel — check AFK ──
+            elif vc.channel.id != VOICE_CH_ID:
+                idle = idle_seconds(gid)
+                if idle >= AFK_TIMEOUT:
+                    print(f"💤 Idle {int(idle)}s — returning to home channel")
+
+                    # Stop music if playing
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
+                    queues[gid] = []
+                    current[gid] = None
+
+                    await vc.move_to(home_ch)
+                    print(f"✅ Returned to: {home_ch.name}")
+
+                    # Notify text channel if set
+                    if TEXT_CH_ID:
+                        tc = bot.get_channel(TEXT_CH_ID)
+                        if tc:
+                            await tc.send(
+                                f"💤 No activity for **{AFK_TIMEOUT // 60} minutes** — returned to home channel!"
+                            )
+
+                    # Update now playing embed to idle
+                    msg = np_message.get(gid)
+                    if msg:
+                        try:
+                            embed = Embed(
+                                title="💤 Returned to Home",
+                                description="No activity detected — use `/play` to start music!",
+                                color=0x95a5a6
+                            )
+                            await msg.edit(embed=embed, view=None)
+                        except Exception:
+                            pass
+
         except Exception as e:
             print(f"⚠️ Reconnect error: {e}")
 
@@ -318,20 +372,6 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Avatar: {e}")
 
-    bot.loop.create_task(status_loop())
-    bot.loop.create_task(voice_reconnect_loop())
-
-    # Auto join home voice channel
-    if VOICE_CH_ID:
-        await asyncio.sleep(3)
-        try:
-            ch = bot.get_channel(VOICE_CH_ID) or await bot.fetch_channel(VOICE_CH_ID)
-            if ch and isinstance(ch, discord.VoiceChannel):
-                await ch.connect(reconnect=True)
-                print(f"✅ Joined voice: {ch.name}")
-        except Exception as e:
-            print(f"⚠️ Voice join: {e}")
-
     print("✅ All systems go! 🎵")
 
 # ─── SLASH COMMANDS ───────────────────────────────────────
@@ -344,6 +384,7 @@ async def play(interaction: discord.Interaction, query: str):
             f"❌ Use commands in <#{TEXT_CH_ID}>!", ephemeral=True
         )
     await interaction.response.defer()
+    update_activity(interaction.guild.id)
 
     vc = await get_or_connect_vc(interaction)
     if not vc:
@@ -403,6 +444,7 @@ async def nowplaying(interaction: discord.Interaction):
 
 @tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
+    update_activity(interaction.guild.id)
     vc = interaction.guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
@@ -412,6 +454,7 @@ async def skip(interaction: discord.Interaction):
 
 @tree.command(name="pause", description="Pause playback")
 async def pause(interaction: discord.Interaction):
+    update_activity(interaction.guild.id)
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
@@ -421,6 +464,7 @@ async def pause(interaction: discord.Interaction):
 
 @tree.command(name="resume", description="Resume playback")
 async def resume(interaction: discord.Interaction):
+    update_activity(interaction.guild.id)
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
@@ -542,8 +586,27 @@ async def run_web():
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web server on port {port}")
 
+async def _auto_join_home():
+    """Join home voice channel on startup."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(5)
+    if not VOICE_CH_ID:
+        return
+    try:
+        ch = bot.get_channel(VOICE_CH_ID) or await bot.fetch_channel(VOICE_CH_ID)
+        if ch and isinstance(ch, discord.VoiceChannel):
+            vc = ch.guild.voice_client
+            if not vc or not vc.is_connected():
+                await ch.connect(reconnect=True)
+                print(f"✅ Auto-joined: {ch.name}")
+    except Exception as e:
+        print(f"⚠️ Auto-join: {e}")
+
 @bot.event
 async def setup_hook():
     await run_web()
+    asyncio.ensure_future(status_loop())
+    asyncio.ensure_future(voice_reconnect_loop())
+    asyncio.ensure_future(_auto_join_home())
 
 bot.run(BOT_TOKEN)
